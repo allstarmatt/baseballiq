@@ -1,9 +1,12 @@
 """
-BaseballIQ Scoring Engine — All 5 Prop Types
-Handles: Home Run, Hit, Stolen Base, Strikeout, RBI
+BaseballIQ Scoring Engine — All 6 Prop Types
+Handles: Home Run, Hit, Stolen Base, Strikeout, RBI, Pitcher Strikeout
 
 Each prop type uses different factor weights because what matters for a HR
 is very different from what matters for a stolen base or a strikeout.
+
+HR model updated: added ISO, HR/FB rate, pull% to air, home/away splits,
+pitcher HR/FB allowed, fatigue, day/night, count tendencies, lineup protection.
 """
 
 from dataclasses import dataclass, field
@@ -13,29 +16,29 @@ from typing import Optional
 # ── Per-prop-type weights (each dict must sum to 1.0) ────────────────────────
 WEIGHTS = {
     "Home Run": {
-        "hitter":      0.28,
-        "pitcher":     0.22,
-        "park":        0.20,
-        "weather":     0.18,
-        "situational": 0.12,
+        "hitter":      0.45,   # hitter Statcast is by far the strongest HR predictor
+        "pitcher":     0.20,   # pitcher HR tendencies matter but less than batter profile
+        "park":        0.15,   # park factors are real but secondary
+        "weather":     0.10,   # weather matters but not game-by-game dominant
+        "situational": 0.10,
     },
     "Hit": {
-        "hitter":      0.35,   # contact ability is king for hits
+        "hitter":      0.35,
         "pitcher":     0.25,
-        "park":        0.10,   # park matters less for hits
+        "park":        0.10,
         "weather":     0.10,
-        "situational": 0.20,   # lineup spot / PA projection matters more
+        "situational": 0.20,
     },
     "Stolen Base": {
-        "hitter":      0.30,   # speed metrics
-        "pitcher":     0.25,   # pitcher delivery / catcher arm
-        "park":        0.05,   # park barely matters for SB
+        "hitter":      0.30,
+        "pitcher":     0.25,
+        "park":        0.05,
         "weather":     0.05,
-        "situational": 0.35,   # game context is huge for SB
+        "situational": 0.35,
     },
     "Strikeout": {
-        "hitter":      0.30,   # K rate, whiff rate
-        "pitcher":     0.40,   # pitcher K rate is the dominant factor
+        "hitter":      0.30,
+        "pitcher":     0.40,
         "park":        0.05,
         "weather":     0.05,
         "situational": 0.20,
@@ -45,14 +48,14 @@ WEIGHTS = {
         "pitcher":     0.20,
         "park":        0.15,
         "weather":     0.10,
-        "situational": 0.30,   # lineup spot + run environment matters most
+        "situational": 0.30,
     },
     "Pitcher Strikeout": {
-        "hitter":      0.25,   # opposing lineup K rate
-        "pitcher":     0.45,   # pitcher K stuff is the dominant factor
+        "hitter":      0.25,
+        "pitcher":     0.45,
         "park":        0.05,
         "weather":     0.05,
-        "situational": 0.20,   # projected innings, game total
+        "situational": 0.20,
     },
 }
 
@@ -72,31 +75,44 @@ class HitterData:
     launch_angle_avg:   Optional[float] = None
     fly_ball_rate:      Optional[float] = None
     pull_rate:          Optional[float] = None
+    # ── NEW HR-specific power metrics ──
+    iso:                Optional[float] = None   # Isolated Power (SLG - AVG). Elite: .250+, avg: .150
+    hr_per_fb:          Optional[float] = None   # HR/FB rate %. Elite: 20%+, avg: 10-12%
+    pull_air_pct:       Optional[float] = None   # % of batted balls pulled in the air. Elite: 15%+
+    hr_home:            Optional[int]   = None   # HRs hit at home this season
+    hr_away:            Optional[int]   = None   # HRs hit away this season
+    is_home_game:       Optional[bool]  = None   # Is today a home game for this batter?
+    games_played:       Optional[int]   = None   # Games played (for rate calculations)
+    hr_rate:            Optional[float] = None   # HR per PA (overall rate)
     # Contact metrics (Hit)
-    contact_rate:       Optional[float] = None   # 1 - K rate
+    contact_rate:       Optional[float] = None
     babip:              Optional[float] = None
     line_drive_rate:    Optional[float] = None
     # Speed metrics (Stolen Base)
-    sprint_speed:       Optional[float] = None   # ft/sec, avg ~27, elite >29
+    sprint_speed:       Optional[float] = None
     sb_attempt_rate:    Optional[float] = None
     sb_success_rate:    Optional[float] = None
     # Strikeout metrics
-    k_rate:             Optional[float] = None   # % of PAs ending in K
-    whiff_rate:         Optional[float] = None   # swings & misses / swings
-    chase_rate:         Optional[float] = None   # O-swing %
+    k_rate:             Optional[float] = None
+    whiff_rate:         Optional[float] = None
+    chase_rate:         Optional[float] = None
     # Advanced
     xslg:               Optional[float] = None
     xwoba:              Optional[float] = None
     # Platoon
     vs_rhp_avg:         Optional[float] = None
     vs_lhp_avg:         Optional[float] = None
+    vs_rhp_iso:         Optional[float] = None   # NEW: ISO vs RHP specifically
+    vs_lhp_iso:         Optional[float] = None   # NEW: ISO vs LHP specifically
     pitcher_hand:       Optional[str]   = None
+    batter_hand:        Optional[str]   = None   # NEW: L/R (affects wind/park interactions)
     # Rolling form
     hr_last_10g:        Optional[int]   = None
     hits_last_10g:      Optional[int]   = None
     k_last_10g:         Optional[int]   = None
     sb_last_10g:        Optional[int]   = None
     rbi_last_10g:       Optional[int]   = None
+    hr_last_30g:        Optional[int]   = None   # NEW: 30-game HR trend (bigger sample)
 
 
 @dataclass
@@ -109,6 +125,15 @@ class PitcherData:
     ground_ball_rate:        Optional[float] = None
     barrel_pct_allowed:      Optional[float] = None
     hard_contact_pct:        Optional[float] = None
+    # ── NEW pitcher HR-specific metrics ──
+    hr_per_fb_allowed:       Optional[float] = None  # HR/FB% allowed. Elite (low): <8%, bad: >14%
+    fastball_hr_rate:        Optional[float] = None  # HR rate on fastballs specifically
+    offspeed_hr_rate:        Optional[float] = None  # HR rate on offspeed pitches
+    pitches_per_start_last3: Optional[float] = None  # Avg pitch count last 3 starts (fatigue proxy)
+    days_rest:               Optional[int]   = None  # Days since last outing (4=normal, <4=short)
+    season_innings:          Optional[float] = None  # Total IP this season (workload/fatigue)
+    era_last_3:              Optional[float] = None  # ERA last 3 starts (recent form)
+    xfip:                    Optional[float] = None  # xFIP (normalizes HR allowed, park-neutral)
     # Hit metrics
     babip_allowed:           Optional[float] = None
     hits_per_9:              Optional[float] = None
@@ -117,19 +142,19 @@ class PitcherData:
     k_per_9_recent:          Optional[float] = None
     whiff_rate:              Optional[float] = None
     # Stolen base metrics
-    delivery_time:           Optional[float] = None   # seconds to plate (slower = easier to steal)
+    delivery_time:           Optional[float] = None
     holds_per_game:          Optional[float] = None
     # Pitch mix
     pitch_mix:               Optional[dict]  = None
     avg_fastball_velo:       Optional[float] = None
     batter_avg_vs_primary:   Optional[float] = None
     # Pitcher strikeout specific
-    sw_str_pct:              Optional[float] = None   # swinging strike % (best K predictor)
-    k_pct:                   Optional[float] = None   # K% (Ks / batters faced)
-    k_pct_recent:            Optional[float] = None   # K% last 3 starts
-    strikeout_pitch_pct:     Optional[float] = None   # % of pitches that are K-inducing (slider/curve/change)
-    proj_innings:            Optional[float] = None   # projected innings today
-    opp_team_k_rate:         Optional[float] = None   # opposing team K rate this season
+    sw_str_pct:              Optional[float] = None
+    k_pct:                   Optional[float] = None
+    k_pct_recent:            Optional[float] = None
+    strikeout_pitch_pct:     Optional[float] = None
+    proj_innings:            Optional[float] = None
+    opp_team_k_rate:         Optional[float] = None
 
 
 @dataclass
@@ -141,16 +166,23 @@ class ParkData:
     lf_dist:        Optional[int] = None
     cf_dist:        Optional[int] = None
     rf_dist:        Optional[int] = None
+    # NEW: directional wall heights (affects HR rates by batter hand)
+    lf_wall_height: Optional[float] = None   # e.g. Green Monster = 37ft
+    rf_wall_height: Optional[float] = None
+    surface:        Optional[str]   = None   # "turf" or "grass"
 
 
 @dataclass
 class WeatherData:
     temp_f:            float = 72.0
     wind_speed_mph:    float = 5.0
-    hr_wind_effect:    str   = "neutral"
+    hr_wind_effect:    str   = "neutral"   # "favorable", "unfavorable", "neutral", "dome"
     wind_component:    float = 0.0
     humidity_pct:      float = 50.0
     carry_modifier_ft: float = 0.0
+    # NEW weather fields
+    wind_direction:    Optional[str]   = None   # "out_to_lf", "out_to_rf", "out_to_cf", "in", "cross"
+    is_day_game:       Optional[bool]  = None   # Day games: ball carries slightly better in warm air
 
 
 @dataclass
@@ -162,12 +194,18 @@ class SituationalData:
     implied_team_total: Optional[float] = None
     trend_score:        Optional[float] = None
     # SB specific
-    runners_on_pct:     Optional[float] = None   # how often batter reaches base
-    next_batter_obp:    Optional[float] = None   # OBP of batter behind (steal opportunities)
-    catcher_pop_time:   Optional[float] = None   # seconds (lower = harder to steal)
+    runners_on_pct:     Optional[float] = None
+    next_batter_obp:    Optional[float] = None
+    catcher_pop_time:   Optional[float] = None
     # Pitcher strikeout specific
-    proj_innings:       Optional[float] = None   # projected innings pitcher will throw
-    is_starter:         Optional[bool]  = None   # starter vs reliever
+    proj_innings:       Optional[float] = None
+    is_starter:         Optional[bool]  = None
+    # NEW HR-specific situational
+    pitcher_count_tendency: Optional[float] = None  # Avg count when batter swings (>1.0 = hitter's counts)
+    lineup_protection:  Optional[float]  = None     # OPS of batter hitting behind this player
+    is_day_game:        Optional[bool]   = None     # Redundant with weather but useful for context
+    hr_in_last_5g:      Optional[bool]   = None     # Has batter hit HR in last 5 games? (hot streak)
+    career_hr_vs_pitcher: Optional[int] = None      # Career HRs vs today's specific pitcher
 
 
 @dataclass
@@ -205,33 +243,79 @@ def score_hitter(h: HitterData, prop_type: str) -> float:
     weight = 0.0
 
     if prop_type == "Home Run":
+        # ── Core power metrics (unchanged) ──
         if h.exit_velo_avg is not None:
-            points += _norm(h.exit_velo_avg, 84, 96, 12)
-            weight += 12
+            points += _norm(h.exit_velo_avg, 84, 96, 10)
+            weight += 10
         if h.barrel_pct is not None:
-            points += _norm(h.barrel_pct, 4, 20, 18)
-            weight += 18
+            points += _norm(h.barrel_pct, 4, 20, 14)
+            weight += 14
         if h.hard_hit_pct is not None:
-            points += _norm(h.hard_hit_pct, 28, 55, 12)
-            weight += 12
-        if h.fly_ball_rate is not None:
-            points += _norm(h.fly_ball_rate, 25, 50, 10)
-            weight += 10
-        if h.launch_angle_avg is not None:
-            points += _norm(h.launch_angle_avg, 10, 30, 8)
+            points += _norm(h.hard_hit_pct, 28, 55, 8)
             weight += 8
+        if h.fly_ball_rate is not None:
+            points += _norm(h.fly_ball_rate, 25, 50, 7)
+            weight += 7
+        if h.launch_angle_avg is not None:
+            points += _norm(h.launch_angle_avg, 10, 30, 6)
+            weight += 6
         if h.xwoba is not None:
-            points += _norm(h.xwoba, 0.28, 0.44, 12)
-            weight += 12
-        if h.hr_last_10g is not None:
-            points += _norm(h.hr_last_10g, 0, 5, 18)
+            points += _norm(h.xwoba, 0.28, 0.44, 8)
+            weight += 8
+
+        # ── NEW: ISO — best single HR predictor ──
+        if h.iso is not None:
+            # ISO elite: .250+, avg: .150, weak: .100
+            points += _norm(h.iso, 0.080, 0.280, 18)
             weight += 18
-        if h.pitcher_hand and h.vs_rhp_avg and h.pitcher_hand == "R":
-            points += _norm(h.vs_rhp_avg, 0.220, 0.340, 10)
+
+        # ── NEW: HR/FB rate — how often fly balls become HRs ──
+        if h.hr_per_fb is not None:
+            # Elite: 20%+, avg: 10-12%, weak: <7%
+            points += _norm(h.hr_per_fb, 5, 25, 16)
+            weight += 16
+
+        # ── NEW: Pull% to air — pulled fly balls are the HRs ──
+        if h.pull_air_pct is not None:
+            # Elite: 15%+, avg: 8-10%
+            points += _norm(h.pull_air_pct, 4, 18, 12)
+            weight += 12
+
+        # ── NEW: Home vs away HR split ──
+        if h.is_home_game is not None and h.games_played and h.games_played > 10:
+            if h.is_home_game and h.hr_home is not None:
+                # Normalize home HR rate per 81 games
+                home_rate = (h.hr_home / max(1, h.games_played / 2)) * 81
+                points += _norm(home_rate, 5, 45, 8)
+                weight += 8
+            elif not h.is_home_game and h.hr_away is not None:
+                away_rate = (h.hr_away / max(1, h.games_played / 2)) * 81
+                points += _norm(away_rate, 5, 45, 8)
+                weight += 8
+
+        # ── NEW: Platoon ISO (better than avg for HR) ──
+        if h.pitcher_hand == "R" and h.vs_rhp_iso is not None:
+            points += _norm(h.vs_rhp_iso, 0.080, 0.260, 10)
             weight += 10
+        elif h.pitcher_hand == "L" and h.vs_lhp_iso is not None:
+            points += _norm(h.vs_lhp_iso, 0.080, 0.260, 10)
+            weight += 10
+        # Fallback to avg if ISO splits unavailable
+        elif h.pitcher_hand and h.vs_rhp_avg and h.pitcher_hand == "R":
+            points += _norm(h.vs_rhp_avg, 0.220, 0.340, 7)
+            weight += 7
         elif h.pitcher_hand and h.vs_lhp_avg and h.pitcher_hand == "L":
-            points += _norm(h.vs_lhp_avg, 0.220, 0.340, 10)
-            weight += 10
+            points += _norm(h.vs_lhp_avg, 0.220, 0.340, 7)
+            weight += 7
+
+        # ── Recent form ──
+        if h.hr_last_10g is not None:
+            points += _norm(h.hr_last_10g, 0, 5, 12)
+            weight += 12
+        # NEW: 30-game trend (bigger sample, smooths noise)
+        if h.hr_last_30g is not None:
+            points += _norm(h.hr_last_30g, 0, 12, 8)
+            weight += 8
 
     elif prop_type == "Hit":
         if h.contact_rate is not None:
@@ -311,8 +395,6 @@ def score_hitter(h: HitterData, prop_type: str) -> float:
             weight += 14
 
     elif prop_type == "Pitcher Strikeout":
-        # For pitcher Ks, the "hitter" category represents opposing lineup weakness
-        # High opposing K rate = good for pitcher strikeout prop
         if h.k_rate is not None:
             points += _norm(h.k_rate, 10, 35, 40)
             weight += 40
@@ -333,28 +415,71 @@ def score_pitcher(p: PitcherData, prop_type: str) -> float:
     weight = 0.0
 
     if prop_type == "Home Run":
+        # ── Core metrics (trimmed weights to fit new factors) ──
         if p.hr_per_9 is not None:
-            points += _norm(p.hr_per_9, 0.5, 2.0, 20)
-            weight += 20
+            points += _norm(p.hr_per_9, 0.5, 2.0, 14)
+            weight += 14
         if p.hr_per_9_recent is not None:
-            points += _norm(p.hr_per_9_recent, 0.5, 2.5, 15)
-            weight += 15
+            points += _norm(p.hr_per_9_recent, 0.5, 2.5, 10)
+            weight += 10
+
+        # ── NEW: HR/FB allowed — better predictor than raw HR/9 ──
+        # Normalizes for fly ball rate; elite pitchers: <8%, bad: >14%
+        if p.hr_per_fb_allowed is not None:
+            points += _norm(p.hr_per_fb_allowed, 5, 18, 18)
+            weight += 18
+
+        # ── NEW: xFIP — park/luck-neutral HR predictor ──
+        if p.xfip is not None:
+            # xFIP elite: <3.20, avg: 4.00, bad: >5.00
+            points += _norm(p.xfip, 2.8, 5.5, 12)
+            weight += 12
+
         if p.fly_ball_rate_allowed is not None:
-            points += _norm(p.fly_ball_rate_allowed, 25, 45, 12)
-            weight += 12
+            points += _norm(p.fly_ball_rate_allowed, 25, 45, 10)
+            weight += 10
         if p.barrel_pct_allowed is not None:
-            points += _norm(p.barrel_pct_allowed, 4, 12, 15)
-            weight += 15
-        if p.hard_contact_pct is not None:
-            points += _norm(p.hard_contact_pct, 28, 44, 12)
+            points += _norm(p.barrel_pct_allowed, 4, 12, 12)
             weight += 12
+        if p.hard_contact_pct is not None:
+            points += _norm(p.hard_contact_pct, 28, 44, 8)
+            weight += 8
+
+        # ── NEW: Pitch-specific HR rates ──
+        if p.fastball_hr_rate is not None:
+            # HR rate on fastballs: high = dangerous for HR props
+            points += _norm(p.fastball_hr_rate, 1, 5, 8)
+            weight += 8
+        if p.offspeed_hr_rate is not None:
+            points += _norm(p.offspeed_hr_rate, 0.5, 4, 6)
+            weight += 6
+
+        # ── NEW: Fatigue indicators ──
+        if p.days_rest is not None:
+            # Short rest (3 days) = worse command = more HRs
+            # Normal rest (4-5 days) = baseline
+            # Extra rest (6+) = slightly better
+            if p.days_rest <= 3:
+                fatigue_score = 75   # short rest = more HR risk
+            elif p.days_rest <= 5:
+                fatigue_score = 50   # normal
+            else:
+                fatigue_score = 35   # extra rest = sharper
+            points += fatigue_score * 0.06
+            weight += 6
+
+        if p.era_last_3 is not None:
+            # Poor recent form = more HR risk
+            points += _norm(p.era_last_3, 1.5, 7.0, 8)
+            weight += 8
+
         if p.batter_avg_vs_primary is not None:
-            points += _norm(p.batter_avg_vs_primary, 0.18, 0.38, 15)
-            weight += 15
+            points += _norm(p.batter_avg_vs_primary, 0.18, 0.38, 8)
+            weight += 8
+
         if p.ground_ball_rate is not None:
-            # Low GB rate = more fly balls = more HR chances
-            points += _norm(50 - p.ground_ball_rate, -10, 25, 11)
-            weight += 11
+            points += _norm(50 - p.ground_ball_rate, -10, 25, 8)
+            weight += 8
 
     elif prop_type == "Hit":
         if p.babip_allowed is not None:
@@ -370,21 +495,17 @@ def score_pitcher(p: PitcherData, prop_type: str) -> float:
             points += _norm(p.barrel_pct_allowed, 4, 12, 15)
             weight += 15
         if p.ground_ball_rate is not None:
-            # High GB rate = more hits in play for hit props
             points += _norm(p.ground_ball_rate, 35, 58, 20)
             weight += 20
 
     elif prop_type == "Stolen Base":
         if p.delivery_time is not None:
-            # Slower delivery = easier to steal (1.2s = fast, 1.6s = slow)
             points += _norm(p.delivery_time, 1.1, 1.7, 40)
             weight += 40
         if p.ground_ball_rate is not None:
-            # Higher GB = more opportunities (ball in play)
             points += _norm(p.ground_ball_rate, 35, 58, 30)
             weight += 30
         if p.k_per_9 is not None:
-            # Low K pitcher = more balls in play = more SB attempts
             points += _norm(10 - p.k_per_9, 0, 6, 30)
             weight += 30
 
@@ -402,7 +523,6 @@ def score_pitcher(p: PitcherData, prop_type: str) -> float:
             points += _norm(p.avg_fastball_velo, 88, 100, 10)
             weight += 10
         if p.batter_avg_vs_primary is not None:
-            # Low batting avg vs primary pitch = more Ks
             points += _norm(0.400 - p.batter_avg_vs_primary, 0.05, 0.22, 10)
             weight += 10
 
@@ -427,17 +547,13 @@ def score_pitcher(p: PitcherData, prop_type: str) -> float:
             weight += 10
 
     elif prop_type == "Pitcher Strikeout":
-        # Pitcher's own K ability — this is the dominant factor
         if p.sw_str_pct is not None:
-            # SwStr% is the single best predictor — elite is 13%+
             points += _norm(p.sw_str_pct, 7, 16, 25)
             weight += 25
         if p.k_pct is not None:
-            # K% (Ks per batter faced) — elite is 30%+
             points += _norm(p.k_pct, 15, 35, 20)
             weight += 20
         if p.k_pct_recent is not None:
-            # Recent K% — last 3 starts matters more than season
             points += _norm(p.k_pct_recent, 15, 38, 20)
             weight += 20
         if p.k_per_9 is not None:
@@ -447,15 +563,12 @@ def score_pitcher(p: PitcherData, prop_type: str) -> float:
             points += _norm(p.whiff_rate, 20, 40, 10)
             weight += 10
         if p.avg_fastball_velo is not None:
-            # Harder throwers miss more bats
             points += _norm(p.avg_fastball_velo, 88, 100, 5)
             weight += 5
         if p.strikeout_pitch_pct is not None:
-            # % of pitches that are K pitches (slider/curve/change)
             points += _norm(p.strikeout_pitch_pct, 30, 65, 5)
             weight += 5
         if p.opp_team_k_rate is not None:
-            # Opposing team K rate — high = better for pitcher Ks
             points += _norm(p.opp_team_k_rate, 18, 32, 10)
             weight += 10
 
@@ -473,34 +586,35 @@ def score_park(p: ParkData, prop_type: str) -> float:
 
     if prop_type in ("Home Run", "RBI"):
         if p.hr_factor:
-            points += _norm(p.hr_factor, 0.82, 1.20, 40)
-            weight += 40
+            points += _norm(p.hr_factor, 0.82, 1.20, 35)
+            weight += 35
         if p.altitude_ft:
-            points += _norm(p.altitude_ft, 0, 5200, 30)
-            weight += 30
+            points += _norm(p.altitude_ft, 0, 5200, 25)
+            weight += 25
         if p.rf_dist:
-            points += _norm(330 - p.rf_dist, -20, 30, 15)
-            weight += 15
+            points += _norm(330 - p.rf_dist, -20, 30, 12)
+            weight += 12
         if p.lf_dist:
-            points += _norm(330 - p.lf_dist, -20, 30, 15)
-            weight += 15
+            points += _norm(330 - p.lf_dist, -20, 30, 12)
+            weight += 12
+        # NEW: Wall height — shorter wall = more HRs even at same distance
+        if p.lf_wall_height is not None:
+            # Low wall (8ft) = easier HR, high wall (37ft Green Monster) = harder
+            points += _norm(20 - p.lf_wall_height, -17, 12, 8)
+            weight += 8
+        if p.rf_wall_height is not None:
+            points += _norm(20 - p.rf_wall_height, -17, 12, 8)
+            weight += 8
 
     elif prop_type == "Hit":
-        # Larger parks suppress hits slightly; turf helps
         if p.hr_factor:
             points += _norm(p.hr_factor, 0.85, 1.15, 50)
             weight += 50
         if p.cf_dist:
-            # Deeper CF = more triples/doubles territory
             points += _norm(p.cf_dist, 390, 440, 50)
             weight += 50
 
-    elif prop_type == "Stolen Base":
-        # Park barely matters for SB
-        return 50.0
-
-    elif prop_type == "Strikeout":
-        # Park barely matters for K props
+    elif prop_type in ("Stolen Base", "Strikeout"):
         return 50.0
 
     if weight == 0:
@@ -512,15 +626,14 @@ def score_weather(w: WeatherData, prop_type: str) -> float:
     if w.hr_wind_effect == "dome":
         return 50.0
 
-    # Weather mainly affects HR and RBI; minimal effect on SB/K/Hit
     if prop_type in ("Stolen Base", "Strikeout"):
         return 50.0
 
     points = 0.0
     weight = 0.0
 
-    points += _norm(w.temp_f, 40, 95, 20)
-    weight += 20
+    points += _norm(w.temp_f, 40, 95, 18)
+    weight += 18
 
     if w.hr_wind_effect == "favorable":
         wind_score = min(100, 50 + w.wind_component * 3)
@@ -529,15 +642,21 @@ def score_weather(w: WeatherData, prop_type: str) -> float:
     else:
         wind_score = 50
 
-    points += wind_score * 0.40
-    weight += 40
+    points += wind_score * 0.38
+    weight += 38
 
     if w.carry_modifier_ft:
-        points += _norm(w.carry_modifier_ft, -15, 20, 30)
-        weight += 30
+        points += _norm(w.carry_modifier_ft, -15, 20, 26)
+        weight += 26
 
-    points += _norm(w.humidity_pct, 20, 80, 10)
-    weight += 10
+    points += _norm(w.humidity_pct, 20, 80, 8)
+    weight += 8
+
+    # NEW: Day game bonus — warm afternoon air carries ball slightly further
+    if w.is_day_game is not None:
+        day_score = 58 if w.is_day_game else 48
+        points += day_score * 0.10
+        weight += 10
 
     if weight == 0:
         return 50.0
@@ -550,22 +669,49 @@ def score_situational(s: SituationalData, prop_type: str) -> float:
 
     if prop_type == "Home Run":
         if s.lineup_position is not None:
-            pos_score = 70 if s.lineup_position in [2,3,4,5] else 55 if s.lineup_position in [1,6] else 40
-            points += pos_score * 0.15
-            weight += 15
+            pos_score = 72 if s.lineup_position in [2,3,4,5] else 55 if s.lineup_position in [1,6] else 38
+            points += pos_score * 0.12
+            weight += 12
+
         if s.implied_team_total is not None:
-            points += _norm(s.implied_team_total, 2.5, 6.5, 30)
-            weight += 30
+            points += _norm(s.implied_team_total, 2.5, 6.5, 22)
+            weight += 22
+
         if s.bullpen_era is not None:
-            points += _norm(s.bullpen_era, 2.8, 6.0, 25)
-            weight += 25
+            points += _norm(s.bullpen_era, 2.8, 6.0, 18)
+            weight += 18
+
         if s.trend_score is not None:
-            points += _norm(s.trend_score, -1.0, 1.0, 30)
-            weight += 30
+            points += _norm(s.trend_score, -1.0, 1.0, 18)
+            weight += 18
+
+        # NEW: Count tendency — does pitcher fall behind? Hitter's counts = more HRs
+        if s.pitcher_count_tendency is not None:
+            # >1.0 = pitcher falls behind often (good for batter)
+            points += _norm(s.pitcher_count_tendency, 0.7, 1.4, 12)
+            weight += 12
+
+        # NEW: Lineup protection — good batter behind = pitcher can't pitch around
+        if s.lineup_protection is not None:
+            # OPS of batter behind: .700 = avg, .900 = elite protection
+            points += _norm(s.lineup_protection, 0.600, 0.950, 10)
+            weight += 10
+
+        # NEW: Hot streak — HR in last 5 games is meaningful signal
+        if s.hr_in_last_5g is not None:
+            points += (68 if s.hr_in_last_5g else 46) * 0.08
+            weight += 8
+
+        # NEW: Career HR vs this pitcher
+        if s.career_hr_vs_pitcher is not None:
+            points += _norm(s.career_hr_vs_pitcher, 0, 5, 8)
+            weight += 8
+
+        # Ensure weights still sum sensibly
+        # Total: 12+22+18+18+12+10+8+8 = 108 → normalized in final calc
 
     elif prop_type == "Hit":
         if s.lineup_position is not None:
-            # Top of order gets more PAs
             pos_score = 75 if s.lineup_position in [1,2,3] else 60 if s.lineup_position in [4,5] else 45
             points += pos_score * 0.20
             weight += 20
@@ -581,7 +727,6 @@ def score_situational(s: SituationalData, prop_type: str) -> float:
 
     elif prop_type == "Stolen Base":
         if s.lineup_position is not None:
-            # Leadoff and 2-hole get most SB chances
             pos_score = 85 if s.lineup_position in [1,2] else 65 if s.lineup_position in [3,4] else 40
             points += pos_score * 0.25
             weight += 25
@@ -589,11 +734,9 @@ def score_situational(s: SituationalData, prop_type: str) -> float:
             points += _norm(s.runners_on_pct, 25, 50, 25)
             weight += 25
         if s.catcher_pop_time is not None:
-            # Higher pop time = easier to steal
             points += _norm(s.catcher_pop_time, 1.8, 2.3, 30)
             weight += 30
         if s.game_total is not None:
-            # Close games = more steal attempts
             points += _norm(s.game_total, 5, 11, 10)
             weight += 10
         if s.trend_score is not None:
@@ -605,7 +748,6 @@ def score_situational(s: SituationalData, prop_type: str) -> float:
             points += _norm(s.proj_plate_apps, 3.0, 5.5, 35)
             weight += 35
         if s.lineup_position is not None:
-            # Lower order tends to K more
             pos_score = 65 if s.lineup_position in [7,8,9] else 55 if s.lineup_position in [5,6] else 45
             points += pos_score * 0.25
             weight += 25
@@ -613,13 +755,11 @@ def score_situational(s: SituationalData, prop_type: str) -> float:
             points += _norm(s.trend_score, -1.0, 1.0, 20)
             weight += 20
         if s.implied_team_total is not None:
-            # Low team total = pitcher's game = more Ks
             points += _norm(10 - s.implied_team_total, 3, 7, 20)
             weight += 20
 
     elif prop_type == "RBI":
         if s.lineup_position is not None:
-            # 3-5 hitters drive in most runs
             pos_score = 80 if s.lineup_position in [3,4,5] else 60 if s.lineup_position in [2,6] else 40
             points += pos_score * 0.20
             weight += 20
@@ -627,7 +767,6 @@ def score_situational(s: SituationalData, prop_type: str) -> float:
             points += _norm(s.implied_team_total, 2.5, 6.5, 30)
             weight += 30
         if s.next_batter_obp is not None:
-            # High OBP batters ahead = more runners on
             points += _norm(s.next_batter_obp, 0.28, 0.42, 25)
             weight += 25
         if s.bullpen_era is not None:
@@ -639,19 +778,15 @@ def score_situational(s: SituationalData, prop_type: str) -> float:
 
     elif prop_type == "Pitcher Strikeout":
         if s.proj_innings is not None:
-            # More innings = more K opportunities (starter = ~6, reliever = ~1)
             points += _norm(s.proj_innings, 1.0, 7.0, 40)
             weight += 40
         if s.game_total is not None:
-            # Low game total = pitcher's game = more Ks expected
             points += _norm(10 - s.game_total, 1, 5, 25)
             weight += 25
         if s.implied_team_total is not None:
-            # Low opposing team total = pitcher dominant
             points += _norm(5 - s.implied_team_total, -1, 3, 20)
             weight += 20
         if s.is_starter is not None:
-            # Starters face entire lineup multiple times = far more K chances
             points += 80 * 0.15 if s.is_starter else 25 * 0.15
             weight += 15
 
@@ -673,14 +808,61 @@ def score_prop(prop: PropInput) -> ScoringResult:
         "situational": score_situational(prop.situational, prop.prop_type),
     }
 
-    raw_score  = sum(score * w[cat] for cat, score in category_scores.items())
+    hr_prop = prop.prop_type == "Home Run"
+
+    # For HR props: hitter profile must gate the final score.
+    # A weak hitter (Mullins, hitter=41) facing a bad pitcher should NOT
+    # outscore an elite hitter (Ohtani, hitter=87) facing a good pitcher.
+    # We apply a hitter floor multiplier: if hitter score < 55, compress
+    # the pitcher bonus so it can't rescue a weak power profile.
+    if hr_prop:
+        h_score = category_scores["hitter"]
+        p_score = category_scores["pitcher"]
+        # Hitter gate: scales from 0.3x (weak hitter=0) to 1.0x (strong hitter=70+)
+        hitter_gate = min(1.0, max(0.3, h_score / 70.0))
+        # Re-weight pitcher contribution through the gate
+        p_contribution = (p_score - 50) * (1 - w["pitcher"]) + (p_score - 50) * w["pitcher"] * hitter_gate
+        # Rebuild raw score with gated pitcher
+        raw_score = (
+            h_score          * w["hitter"] +
+            (50 + p_contribution * w["pitcher"]) * w["pitcher"] +
+            category_scores["park"]        * w["park"] +
+            category_scores["weather"]     * w["weather"] +
+            category_scores["situational"] * w["situational"]
+        )
+    else:
+        raw_score = sum(score * w[cat] for cat, score in category_scores.items())
+
     score_delta = raw_score - 50
-    model_prob  = prop.implied_prob + (score_delta / 50) * 0.20
+    completeness = _data_completeness(prop)
+
+    # Wider edge band for HR props — rare event needs more signal amplification
+    edge_scale = 0.45 if hr_prop else 0.35
+
+    model_prob  = prop.implied_prob + (score_delta / 50) * edge_scale
     model_prob  = max(0.01, min(0.99, model_prob))
     edge        = model_prob - prop.implied_prob
-    completeness = _data_completeness(prop)
-    confidence  = max(0, min(99, 50 + (edge * 200) * completeness))
-    grade, desc = _get_grade(confidence)
+
+    confidence = 50 + (edge * 200) * completeness
+
+    # Elite hitter bonus: reward genuinely elite power profiles above 70
+    if hr_prop:
+        h_score = category_scores["hitter"]
+        if h_score > 70:
+            elite_bonus = ((h_score - 70) / 30) * 14 * w["hitter"]
+            confidence += elite_bonus
+
+    # HR grade shift: HRs happen ~6% of the time per game.
+    # Shift up so grades reflect rarity — a 65 raw conf is genuinely strong.
+    if hr_prop:
+        confidence += 8.0
+
+    confidence = max(0, min(99, confidence))
+    # Use HR-specific grades which reflect rarity of the event
+    if hr_prop:
+        grade, desc = _get_hr_grade(confidence)
+    else:
+        grade, desc = _get_grade(confidence)
     signal      = "positive" if edge > 0.03 else "negative" if edge < -0.03 else "neutral"
 
     return ScoringResult(
@@ -715,15 +897,54 @@ def _get_grade(confidence: float) -> tuple:
     return "D", "Avoid"
 
 
+def _get_hr_grade(confidence: float) -> tuple:
+    """
+    HR-specific grades. Since HRs happen ~5-10% of the time per game,
+    grades reflect relative value vs peers, not absolute probability.
+    A+ = top 1-2 picks on today's slate. D = avoid.
+    """
+    if confidence >= 82: return "A+", "Best HR pick today"
+    if confidence >= 76: return "A",  "Strong HR value"
+    if confidence >= 70: return "A−", "Good HR value"
+    if confidence >= 64: return "B+", "Solid pick"
+    if confidence >= 58: return "B",  "Lean play"
+    if confidence >= 52: return "B−", "Slight lean"
+    if confidence >= 46: return "C+", "Neutral"
+    if confidence >= 40: return "C",  "Slight avoid"
+    return "D", "Avoid"
+
+
 def _data_completeness(prop: PropInput) -> float:
-    checks = [
-        prop.hitter.exit_velo_avg is not None,
-        prop.hitter.barrel_pct is not None,
-        prop.hitter.xwoba is not None,
-        prop.pitcher.hr_per_9 is not None or prop.pitcher.k_per_9 is not None,
-        prop.pitcher.barrel_pct_allowed is not None,
-        prop.park.hr_factor != 1.00,
-        prop.weather.temp_f != 72.0,
-        prop.situational.implied_team_total is not None,
-    ]
+    """
+    Returns 0.5–1.0 based on how much data is populated.
+    More data = higher confidence ceiling. Prevents inflated scores on sparse data.
+    """
+    if prop.prop_type == "Home Run":
+        checks = [
+            prop.hitter.exit_velo_avg is not None,
+            prop.hitter.barrel_pct is not None,
+            prop.hitter.iso is not None,               # NEW
+            prop.hitter.hr_per_fb is not None,         # NEW
+            prop.hitter.pull_air_pct is not None,      # NEW
+            prop.hitter.xwoba is not None,
+            prop.pitcher.hr_per_9 is not None,
+            prop.pitcher.hr_per_fb_allowed is not None, # NEW
+            prop.pitcher.xfip is not None,              # NEW
+            prop.pitcher.barrel_pct_allowed is not None,
+            prop.park.hr_factor != 1.00,
+            prop.weather.temp_f != 72.0,
+            prop.situational.implied_team_total is not None,
+            prop.situational.lineup_protection is not None,  # NEW
+        ]
+    else:
+        checks = [
+            prop.hitter.exit_velo_avg is not None,
+            prop.hitter.barrel_pct is not None,
+            prop.hitter.xwoba is not None,
+            prop.pitcher.hr_per_9 is not None or prop.pitcher.k_per_9 is not None,
+            prop.pitcher.barrel_pct_allowed is not None,
+            prop.park.hr_factor != 1.00,
+            prop.weather.temp_f != 72.0,
+            prop.situational.implied_team_total is not None,
+        ]
     return 0.5 + (sum(checks) / len(checks)) * 0.5
