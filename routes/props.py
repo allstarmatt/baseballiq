@@ -14,6 +14,7 @@ from services.mlb      import get_todays_games, get_game_lineup
 from services.statcast import get_hitter_statcast, get_pitcher_statcast
 from services.odds     import get_game_totals, get_player_props
 from services.weather  import get_stadium_weather
+from services.name_matching import find_best_match
 from models.scoring    import (
     PropInput, HitterData, PitcherData, ParkData, WeatherData, SituationalData,
     score_prop
@@ -138,13 +139,13 @@ async def _build_all_props() -> list[dict]:
         totals_lookup[gt.get("away_team", "")] = {"game_total": gt.get("game_total"), "team_implied": gt.get("away_implied"), "event_id": gt.get("event_id")}
 
     # Fetch odds for all prop types per game
-    odds_lookup = await _build_odds_lookup(games[:MAX_GAMES_PER_DAY], totals_lookup)
+    odds_lookup, sportsbook_names = await _build_odds_lookup(games[:MAX_GAMES_PER_DAY], totals_lookup)
 
     all_results = []
     for game in games[:MAX_GAMES_PER_DAY]:
         print(f"⚾  {game['away_team']} @ {game['home_team']}")
         try:
-            results = await _process_game(game, totals_lookup, odds_lookup)
+            results = await _process_game(game, totals_lookup, odds_lookup, sportsbook_names)
             all_results.extend(results)
             print(f"   ✓ {len(results)} props")
         except Exception as e:
@@ -157,9 +158,11 @@ async def _build_all_props() -> list[dict]:
 async def _build_odds_lookup(games: list, totals_lookup: dict) -> dict:
     """
     Fetches odds for all prop types for all games.
-    Returns dict: {player_name_lower: {prop_type: {over_odds, implied_prob, line}}}
+    Uses fuzzy name matching to handle sportsbook vs MLB API name differences.
+    Returns dict: {mlb_player_name_lower: {prop_type: {over_odds, implied_prob, line}}}
     """
-    lookup: dict = {}
+    # First collect all raw odds keyed by sportsbook name
+    raw_odds: dict[str, dict] = {}   # {sportsbook_name_lower: {prop_type: data}}
 
     for game in games:
         home_team = game.get("home_team", "")
@@ -176,21 +179,34 @@ async def _build_odds_lookup(games: list, totals_lookup: dict) -> dict:
                 )
                 for prop in props:
                     name_key = prop["player_name"].lower().strip()
-                    if name_key not in lookup:
-                        lookup[name_key] = {}
-                    lookup[name_key][prop_type] = {
+                    if name_key not in raw_odds:
+                        raw_odds[name_key] = {}
+                    raw_odds[name_key][prop_type] = {
                         "over_odds":    prop.get("over_odds", 300),
                         "under_odds":   prop.get("under_odds"),
                         "implied_prob": prop.get("implied_prob_over", 25.0) / 100,
                         "line":         prop.get("line", 0.5),
+                        "sportsbook_name": prop["player_name"],  # keep original for matching
                     }
             except Exception as e:
                 print(f"   Odds fetch failed for {prop_type}: {e}")
 
-    return lookup
+    # Build list of all sportsbook names for fuzzy matching
+    sportsbook_names = list(set(
+        data[pt]["sportsbook_name"]
+        for data in raw_odds.values()
+        for pt in data
+        if "sportsbook_name" in data.get(pt, {})
+    ))
+
+    print(f"   📊 Got odds for {len(sportsbook_names)} unique sportsbook player names")
+
+    # Return raw odds — matching happens per-player in _process_game
+    # where we have the MLB name to match against
+    return raw_odds, sportsbook_names
 
 
-async def _process_game(game: dict, totals_lookup: dict, odds_lookup: dict) -> list[dict]:
+async def _process_game(game: dict, totals_lookup: dict, odds_lookup: dict, sportsbook_names: list) -> list[dict]:
     game_pk = game["game_pk"]
     venue   = game["venue"]
 
@@ -231,8 +247,16 @@ async def _process_game(game: dict, totals_lookup: dict, odds_lookup: dict) -> l
 
         for i, batter in enumerate(batters):
             hitter_sc = hitter_scs[i] if i < len(hitter_scs) else {}
-            name_key  = (batter.get("name") or "").lower().strip()
-            batter_odds = odds_lookup.get(name_key, {})
+            mlb_name  = batter.get("name") or ""
+
+            # Use fuzzy matching to find sportsbook name for this player
+            matched_sb_name = find_best_match(mlb_name, sportsbook_names)
+            if matched_sb_name:
+                batter_odds = odds_lookup.get(matched_sb_name.lower().strip(), {})
+                if matched_sb_name.lower().strip() != mlb_name.lower().strip():
+                    print(f"   🔗 Matched '{mlb_name}' → '{matched_sb_name}'")
+            else:
+                batter_odds = odds_lookup.get(mlb_name.lower().strip(), {})
 
             # Score this batter for each prop type we have odds for
             for prop_type in ALL_PROP_TYPES:
@@ -265,8 +289,14 @@ async def _process_game(game: dict, totals_lookup: dict, odds_lookup: dict) -> l
         # ── Pitcher Strikeout prop (one per pitcher per game) ──────────────────
         own_pitcher_info = game.get(f"{side}_probable_pitcher")
         if own_pitcher_info and own_pitcher_info.get("id"):
-            pitcher_name_key = (own_pitcher_info.get("name") or "").lower().strip()
-            pitcher_odds_data = odds_lookup.get(pitcher_name_key, {}).get("Pitcher Strikeout")
+            pitcher_mlb_name = own_pitcher_info.get("name") or ""
+            matched_pitcher_name = find_best_match(pitcher_mlb_name, sportsbook_names)
+            if matched_pitcher_name:
+                pitcher_odds_data = odds_lookup.get(matched_pitcher_name.lower().strip(), {}).get("Pitcher Strikeout")
+                if matched_pitcher_name.lower().strip() != pitcher_mlb_name.lower().strip():
+                    print(f"   🔗 Pitcher matched '{pitcher_mlb_name}' → '{matched_pitcher_name}'")
+            else:
+                pitcher_odds_data = odds_lookup.get(pitcher_mlb_name.lower().strip(), {}).get("Pitcher Strikeout")
 
             if pitcher_odds_data:
                 try:
