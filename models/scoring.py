@@ -547,30 +547,34 @@ def score_pitcher(p: PitcherData, prop_type: str) -> float:
             weight += 10
 
     elif prop_type == "Pitcher Strikeout":
-        if p.sw_str_pct is not None:
-            points += _norm(p.sw_str_pct, 7, 16, 25)
-            weight += 25
-        if p.k_pct is not None:
-            points += _norm(p.k_pct, 15, 35, 20)
-            weight += 20
-        if p.k_pct_recent is not None:
-            points += _norm(p.k_pct_recent, 15, 38, 20)
-            weight += 20
+        # K/9 is the primary signal — elite starters: 10+, avg: 8, weak: <6
         if p.k_per_9 is not None:
-            points += _norm(p.k_per_9, 5, 14, 15)
-            weight += 15
+            points += _norm(p.k_per_9, 5, 14, 28)
+            weight += 28
+        # K% is better than K/9 (normalizes for balls in play)
+        if p.k_pct is not None:
+            points += _norm(p.k_pct, 15, 36, 22)
+            weight += 22
+        # Recent K% matters more than season — pitcher may be peaking or declining
+        if p.k_pct_recent is not None:
+            points += _norm(p.k_pct_recent, 15, 38, 18)
+            weight += 18
+        # SwStr% is the best leading indicator — swing and miss before Ks register
+        if p.sw_str_pct is not None:
+            points += _norm(p.sw_str_pct, 7, 17, 20)
+            weight += 20
+        # Whiff rate on contact — higher = harder to make contact
         if p.whiff_rate is not None:
-            points += _norm(p.whiff_rate, 20, 40, 10)
-            weight += 10
+            points += _norm(p.whiff_rate, 18, 42, 12)
+            weight += 12
+        # Fastball velo — harder = more swing and miss
         if p.avg_fastball_velo is not None:
-            points += _norm(p.avg_fastball_velo, 88, 100, 5)
-            weight += 5
-        if p.strikeout_pitch_pct is not None:
-            points += _norm(p.strikeout_pitch_pct, 30, 65, 5)
-            weight += 5
+            points += _norm(p.avg_fastball_velo, 88, 100, 8)
+            weight += 8
+        # Opponent team K rate — facing a high-K team amplifies pitcher Ks
         if p.opp_team_k_rate is not None:
-            points += _norm(p.opp_team_k_rate, 18, 32, 10)
-            weight += 10
+            points += _norm(p.opp_team_k_rate, 18, 32, 12)
+            weight += 12
 
     if weight == 0:
         return 50.0
@@ -777,17 +781,23 @@ def score_situational(s: SituationalData, prop_type: str) -> float:
             weight += 10
 
     elif prop_type == "Pitcher Strikeout":
-        if s.proj_innings is not None:
-            points += _norm(s.proj_innings, 1.0, 7.0, 40)
-            weight += 40
-        if s.game_total is not None:
-            points += _norm(10 - s.game_total, 1, 5, 25)
-            weight += 25
-        if s.implied_team_total is not None:
-            points += _norm(5 - s.implied_team_total, -1, 3, 20)
-            weight += 20
+        # Starter vs reliever is the biggest situational factor
+        # Starters get 5-6 IP of K opportunities; relievers get 1-2
         if s.is_starter is not None:
-            points += 80 * 0.15 if s.is_starter else 25 * 0.15
+            starter_score = 78 if s.is_starter else 22
+            points += starter_score * 0.30
+            weight += 30
+        # Projected innings — more innings = more K opportunities
+        if s.proj_innings is not None:
+            points += _norm(s.proj_innings, 1.0, 7.0, 35)
+            weight += 35
+        # Low-scoring games = pitcher is dominant = more Ks
+        if s.game_total is not None:
+            points += _norm(10 - s.game_total, 1, 5, 20)
+            weight += 20
+        # Opponent run environment — low implied total = good pitching matchup
+        if s.implied_team_total is not None:
+            points += _norm(5 - s.implied_team_total, -1, 3, 15)
             weight += 15
 
     if weight == 0:
@@ -916,35 +926,86 @@ def _get_hr_grade(confidence: float) -> tuple:
 
 def _data_completeness(prop: PropInput) -> float:
     """
-    Returns 0.5–1.0 based on how much data is populated.
-    More data = higher confidence ceiling. Prevents inflated scores on sparse data.
+    Returns 0.5–1.0 based on how much relevant data is populated.
+    Each prop type checks only the fields that actually matter for that prop.
     """
-    if prop.prop_type == "Home Run":
+    pt = prop.prop_type
+
+    if pt == "Home Run":
         checks = [
             prop.hitter.exit_velo_avg is not None,
             prop.hitter.barrel_pct is not None,
-            prop.hitter.iso is not None,               # NEW
-            prop.hitter.hr_per_fb is not None,         # NEW
-            prop.hitter.pull_air_pct is not None,      # NEW
+            prop.hitter.iso is not None,
+            prop.hitter.hr_per_fb is not None,
+            prop.hitter.pull_air_pct is not None,
             prop.hitter.xwoba is not None,
             prop.pitcher.hr_per_9 is not None,
-            prop.pitcher.hr_per_fb_allowed is not None, # NEW
-            prop.pitcher.xfip is not None,              # NEW
+            prop.pitcher.hr_per_fb_allowed is not None,
             prop.pitcher.barrel_pct_allowed is not None,
             prop.park.hr_factor != 1.00,
             prop.weather.temp_f != 72.0,
             prop.situational.implied_team_total is not None,
-            prop.situational.lineup_protection is not None,  # NEW
+            prop.situational.lineup_protection is not None,
         ]
-    else:
+
+    elif pt == "Strikeout":
+        checks = [
+            prop.hitter.k_rate is not None,
+            prop.hitter.whiff_rate is not None,
+            prop.hitter.chase_rate is not None,
+            prop.hitter.k_last_10g is not None,
+            prop.pitcher.k_per_9 is not None,
+            prop.pitcher.whiff_rate is not None,
+            prop.situational.proj_plate_apps is not None,
+            prop.situational.implied_team_total is not None,
+        ]
+
+    elif pt == "Pitcher Strikeout":
+        checks = [
+            prop.pitcher.k_per_9 is not None,
+            prop.pitcher.k_pct is not None,
+            prop.pitcher.whiff_rate is not None,
+            prop.pitcher.sw_str_pct is not None,
+            prop.pitcher.avg_fastball_velo is not None,
+            prop.situational.proj_innings is not None,
+            prop.situational.is_starter is not None,
+            prop.situational.game_total is not None,
+        ]
+
+    elif pt == "Hit":
+        checks = [
+            prop.hitter.contact_rate is not None,
+            prop.hitter.babip is not None,
+            prop.hitter.hard_hit_pct is not None,
+            prop.hitter.xwoba is not None,
+            prop.pitcher.babip_allowed is not None,
+            prop.pitcher.hits_per_9 is not None,
+            prop.situational.proj_plate_apps is not None,
+            prop.situational.implied_team_total is not None,
+        ]
+
+    elif pt == "Stolen Base":
+        checks = [
+            prop.hitter.sprint_speed is not None,
+            prop.hitter.sb_success_rate is not None,
+            prop.hitter.sb_attempt_rate is not None,
+            prop.pitcher.delivery_time is not None,
+            prop.situational.lineup_position is not None,
+        ]
+
+    elif pt == "RBI":
         checks = [
             prop.hitter.exit_velo_avg is not None,
             prop.hitter.barrel_pct is not None,
             prop.hitter.xwoba is not None,
-            prop.pitcher.hr_per_9 is not None or prop.pitcher.k_per_9 is not None,
-            prop.pitcher.barrel_pct_allowed is not None,
-            prop.park.hr_factor != 1.00,
-            prop.weather.temp_f != 72.0,
+            prop.pitcher.hr_per_9 is not None,
+            prop.pitcher.hard_contact_pct is not None,
+            prop.situational.lineup_position is not None,
             prop.situational.implied_team_total is not None,
         ]
-    return 0.5 + (sum(checks) / len(checks)) * 0.5
+
+    else:
+        checks = [prop.pitcher.k_per_9 is not None]
+
+    filled = sum(1 for c in checks if c)
+    return 0.5 + (filled / len(checks)) * 0.5
